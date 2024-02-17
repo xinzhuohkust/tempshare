@@ -1,4 +1,7 @@
-path <- \(x = "") sprintf("%s/R/%s", getwd(), x)
+export_path <- \(x = "") sprintf("%s/%s", getwd(), x)
 
-source(path("functions.R"))
+source(export_path("R/functions.R"))
+
+session_info() %>%
+    write_rds(export_path("data/raw/session_info.Rds"))
 

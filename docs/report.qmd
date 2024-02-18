@@ -1,0 +1,307 @@
+---
+title: "Text Analysis with Chinese Court Decision Data"
+subtitle: ""
+description: ""
+abstract: ""
+date: last-modified
+author:
+  - name: Xinzhuo HUANG
+    url: xinzhuo.work
+    orcid: 0009-0007-6448-5114
+    eamil: xhuangcb@connect.ust.hk
+    affiliations: 
+    - name: HKUST, SOSC
+title-block-banner: "#CCCCCC"
+
+format: 
+  html:
+    code-summary: "Show the code"
+    code-line-numbers: true
+    code-block-bg: true
+    code-block-border-left: "#5E5857"
+    code-tools:
+      caption: "Source Code"
+    smooth-scroll: true
+    linestretch: 1.2
+    df-print: paged
+    theme: 
+        light: Cosmo
+        dark: Solar
+    code-fold: show # if show the code
+    toc: true
+    toc-location: right
+    number-sections: true
+    monofont: Georia
+    mainfont: Cambria Math
+    link-external-newwindow: true
+    link-external-icon: true
+    other-links: # 在TOC下方增加外部链接
+      - text: Supervised Machine Learning for Text Analysis in R
+        href: https://smltar.com/
+      - text: Text Mining with R
+        href: https://www.tidytextmining.com/
+      - text: Xinzhuo's Website
+        href: https://xinzhuo.work
+link-citations: true
+comments:
+  giscus: 
+    repo: xinzhuohkust/comments
+  hypothesis: 
+    theme: clean
+execute: 
+  warning: false
+  message: false
+---
+
+```{=html}
+<style>
+body {text-align: justify}
+</style>
+```
+
+The workflow of our text analysis is as follows:
+```{mermaid}
+flowchart LR
+    A[Text Data]-->|lac|B[Tokens]
+    B -->|tf-idf|C[Remove stopwords]
+    C --> |One-Hot Encoding|D[Document-Term Matrix]
+```
+
+```{mermaid}
+flowchart LR
+    A[Document-Term Matrix]-->|stm|B[Detect the number of topics]
+```
+
+
+# Load packages and data
+Execute `install.packages("pacman")` to install the `pacman` package, enabling efficient package management.
+```{r}
+pacman::p_load(tidyverse, tidyfst, tidytext, httr2, httr, jsonlite, furrr, listviewer, rvest, crayon, emojifont, devtools, text2vec, reticulate, furrr, stm)
+```
+
+```{r}
+#| eval: false
+#| echo: false
+raw_data <- "S:/OneDrive - HKUST Connect/Scraper/北大法意/data/北大法意寻衅滋事全文.Rds" %>%
+    read_rds()
+
+processed_data <- raw_data %>%
+    unnest(data) %>%
+    distinct(`_id`, .keep_all = TRUE) %>%
+    unnest(ProcessCaseReasons) %>%
+    mutate(
+        across(where(is.character), ~ str_replace_all(., "<font color=red>刑</font>", "刑")),
+        ProcessCaseMatters = map(ProcessCaseMatters, ~ .[, 1]),
+        full_text = map_chr(ProcessCaseMatters, ~ str_c(., collapse = ""))
+    )
+
+processed_data %>%
+    select(full_text) %>%
+    sample_n(size = 1000) %>%
+    write_rds("data/processed/small_sample_data.Rds")
+```
+
+Have a look at our sample data:
+```{r}
+raw_data <- read_rds("E:/OneDrive - HKUST Connect/Research/TextAnalysis/data/processed/small_sample_data.Rds")
+
+raw_data %>%
+    sample_n(size = 1)
+```
+
+
+# Tokenization
+
+## Lexical Analysis of Chinese (LAC)
+
+We will utilize the [lac](https://github.com/baidu/lac) for word segementation, compared to ohter schemes, lac is rather well in entity informatino extraction.
+
+Nevertheless, lac only has a Python version. We can call Python from R using `reticualte` package.
+
+Before that, please install [python==3.86](https://www.python.org/downloads/release/python-386/) and then execute `!pip install lac` to install lac.
+
+Our tokenzier based on the lac is as follows:
+```{r}
+#| eval: false
+reticulate::use_python("C:/Users/xhuangcb/anaconda3/envs/pytorch_gpu/python.exe") # your python location
+
+LAC <- reticulate::import("LAC")
+
+lac_seg <- LAC$LAC(mode = "seg")
+
+lac_analysis <- LAC$LAC(mode = "lac")
+
+tokenizer <- \(string, analysis = FALSE, progress = TRUE, min = 1) {
+    if (progress == TRUE) {
+        bar <- list(
+            format = "Processing: {cli::pb_current}  {cli::pb_bar} {cli::pb_percent}  Rate: {cli::pb_rate}  ETA: {cli::pb_eta}"
+        )
+    } else {
+        bar <- FALSE
+    }
+
+    if (analysis == FALSE) {
+        map(
+            string,
+            \(x) {
+                if (!is.na(nchar(x))) {
+                    if (nchar(x) > 1) {
+                        tokens <- lac_seg$run(x)
+                        tokens <- tokens[nchar(tokens) > min]
+                        return(tokens)
+                    }
+                }
+            },
+            .progress = bar
+        )
+    } else {
+        map(
+            string,
+            \(x) {
+                if (!is.na(nchar(x))) {
+                    if (nchar(x) > 1) {
+                        tokens <- lac_analysis$run(x)
+                        names(tokens[[1]]) <- tokens[[2]]
+                        tokens[[1]] <- tokens[[1]][nchar(tokens[[1]]) > min]
+                        return(tokens[[1]])
+                    }
+                }
+            },
+            .progress = bar
+        )
+    }
+}
+```
+
+## Word Segementaion
+
+Use our tokenizer to perfrom word segementation.
+```{r}
+#| eval: false
+data_processed <- raw_data %>%
+    mutate(
+        words = str_remove_all(full_text, "\\p{P}|\\s+|丨") |> tokenizer(analysis = TRUE, min = 1),
+        id = 1:n()
+    )
+```
+
+## Acquire stopwords
+
+Use TF-IDF algorithm to detect the stopwords.
+```{r}
+#| eval: false
+tfidf <- data_processed %>%
+    unnest_dt(words) %>%
+    count_dt(id, words, sort = TRUE) %>%
+    bind_tf_idf(words, id, n) %>%
+    arrange(tf_idf)
+
+stopwords1 <- tfidf %>%
+    filter(tf_idf < 0.005) %>%
+    # arrange(tf_idf) %>%
+    # slice_head(n = 100)
+    pull(words) %>%
+    unique()
+
+stopwords2 <- data_processed$words %>%
+    unlist() %>%
+    unique() %>%
+    .[str_detect(., "\\d+|[A-z]+")]
+
+stopwords3 <- data_processed$words %>%
+    map(~ .[names(.) %in% c("TIME", "LOC")]) %>%
+    unlist() %>%
+    unique()
+
+stopwords <- c(stopwords1, stopwords2, stopwords3) %>%
+    unique() %>%
+    tibble(words = .)
+```
+
+
+# Topic Modeling
+
+## Acquire Document-Term Matrix
+
+```{r}
+#| eval: false
+matrix <- data_processed %>%
+    unnest_dt(words) %>%
+    anti_join_dt(stopwords) %>%
+    count_dt(id, words, .name = "count") %>%
+    cast_sparse(id, words, count)
+```
+
+## Training
+```{r}
+#| eval: false
+plan(multisession)
+
+topic_models <- tibble(K = c(2:15)) %>%
+    mutate(
+        topic_model = future_map(
+            K,
+            ~ stm(matrix,
+                K = .,
+                verbose = FALSE,
+                init.type = "Spectral"
+            ),
+            .progress = TRUE
+        )
+    )
+```
+
+## Evaluation
+```{r}
+#| eval: false
+heldout <- make.heldout(matrix)
+
+find_bestK <- topic_models %>%
+    mutate(
+        exclusivity = map(topic_model, exclusivity, .progress = TRUE),
+        semantic_coherence = map(topic_model, semanticCoherence, matrix, .progress = TRUE),
+        eval_heldout = map(topic_model, eval.heldout, heldout$missing, .progress = TRUE),
+        residual = map(topic_model, checkResiduals, matrix, .progress = TRUE),
+        bound = map_dbl(topic_model, \(x) max(x$convergence$bound), .progress = TRUE),
+        lfact = map_dbl(topic_model, \(x) lfactorial(x$settings$dim$K), .progress = TRUE),
+        lbound = bound + lfact,
+        iterations = map_dbl(topic_model, \(x) length(x$convergence$bound), .progress = TRUE)
+    )
+
+findK_figure <- find_bestK %>%
+    transmute(
+        K,
+        `Lower bound` = lbound,
+        Residuals = map_dbl(residual, "dispersion"),
+        `Semantic coherence` = map_dbl(semantic_coherence, mean),
+        `Held-out likelihood` = map_dbl(eval_heldout, "expected.heldout")
+    ) %>%
+    pivot_longer(-K, names_to = "Metric", values_to = "Value") %>%
+    ggplot(aes(K, Value, color = Metric)) +
+    geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+    facet_wrap(~Metric, scales = "free_y") +
+    xlab(expression(paste(italic(K), "(number of topics)"))) +
+    labs(
+        y = NULL,
+        # title = "Model diagnostics by number of topics",
+        # subtitle = "These diagnostics indicate that a good number of topics would be around 60"
+    ) +
+    geom_vline(xintercept = 23, linetype = "dotted") +
+    ggthemes::theme_hc(base_family = "Noto Serif SC") +
+    theme(
+        axis.text.x = element_text(family = "EB Garamond"),
+        axis.title = element_text(family = "EB Garamond"),
+        strip.text = element_text(face = "italic", size = 12, family = "EB Garamond")
+    ) 
+```
+
+```{r}
+#| echo: false
+#| eval: false
+write_rds(findK_figure, "data/processed/findK_figure.Rds")
+```
+It is evident that the model performs well when $K$ is approximately 4, indicating that the optimal number of topics detected by the topic modeling algorithm from our sample dataset of 1000 documents is 4.
+```{r}
+#| echo: false
+read_rds("E:/OneDrive - HKUST Connect/Research/TextAnalysis/data/processed/findK_figure.Rds")
+```
